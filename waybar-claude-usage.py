@@ -32,7 +32,6 @@ except ImportError:
 # CONFIG
 # =============================================================================
 
-CLAUDE_ICON    = "󰧿"
 CACHE_FILE     = Path("/tmp/waybar_claude_usage.json")
 LOCK_FILE      = Path("/tmp/waybar_claude_fetch.lock")
 FETCH_SCRIPT   = Path.home() / ".config/waybar/scripts/waybar-claude-fetch.py"
@@ -41,6 +40,9 @@ CACHE_TTL      = 90    # seconds before triggering a background refresh
 BAR_WIDTH      = 20    # characters in progress bar
 ACTIVITY_TTL   = 3600  # seconds — hide module if no claude activity within this window
 HISTORY_FILE   = Path.home() / ".claude" / "history.jsonl"
+PROJECTS_DIR   = Path.home() / ".claude" / "projects"
+TOKEN_CACHE    = Path("/tmp/waybar_claude_tokens.json")
+TOKEN_TTL      = 120   # seconds between token recomputation
 
 
 # =============================================================================
@@ -180,7 +182,7 @@ def build_tooltip(data: Optional[dict], theme: ColorTheme, fetching: bool) -> st
     w = theme.white
     bb = theme.bright_black
 
-    header = f"<span foreground='{w}'>{CLAUDE_ICON} Claude Code Usage</span>"
+    header = f"<span foreground='{w}'>Claude Code Usage</span>"
     lines.append(header)
     lines.append(f"<span foreground='{bb}'>{'─' * 36}</span>")
 
@@ -209,6 +211,15 @@ def build_tooltip(data: Optional[dict], theme: ColorTheme, fetching: bool) -> st
         lines.append(f"  {progress_bar(pct, theme)}")
         if reset:
             lines.append(f"  <span foreground='{bb}'>Resets: {format_reset_display(reset)}</span>")
+        if key in ("week", "weekSonnet"):
+            info = compute_budget_info(section)
+            if info:
+                lines.append(
+                    f"  <span foreground='{w}'>Day {info.current_day}/{info.total_days}"
+                    f" — Budget: {info.cumulative_budget:.1f}%"
+                    f" — Used: {info.actual_percent}%</span>"
+                )
+                lines.append(f"  {budget_bar_text(info, theme)}")
         if key == "extra" and "spent" in section:
             spent = section["spent"]
             limit = section.get("limit", 0)
@@ -217,6 +228,74 @@ def build_tooltip(data: Optional[dict], theme: ColorTheme, fetching: bool) -> st
 
     if not any_shown:
         lines.append(f"<span foreground='{bb}'>No usage data found in last fetch.</span>")
+
+    # Today's token usage
+    tokens = compute_today_tokens()
+    if tokens:
+        lines.append("")
+        lines.append(f"<span foreground='{bb}'>{'─' * 36}</span>")
+        total_msgs = tokens.message_count + tokens.user_msg_count
+        lines.append(
+            f"<span foreground='{w}'>Today</span>"
+            f"  <span foreground='{bb}'>{tokens.session_count} sessions"
+            f" · {total_msgs} msgs · {tokens.tool_call_count} tools</span>"
+        )
+
+        # Models + avg turn
+        model_parts = []
+        for model in sorted(tokens.models, key=lambda m: tokens.models[m]["count"], reverse=True):
+            model_parts.append(f"{_short_model(model)} {tokens.models[model]['count']}")
+        avg_turn = ""
+        if tokens.turn_count > 0:
+            avg_s = tokens.turn_duration_ms / tokens.turn_count / 1000
+            if avg_s >= 60:
+                mins, secs = divmod(int(avg_s), 60)
+                avg_turn = f" · avg turn {mins}m{secs}s"
+            else:
+                avg_turn = f" · avg turn {int(avg_s)}s"
+        if model_parts:
+            lines.append(f"  <span foreground='{bb}'>{' · '.join(model_parts)}{avg_turn}</span>")
+
+        # Top tools
+        sorted_tools = sorted(tokens.tools.items(), key=lambda x: x[1], reverse=True)[:6]
+        if sorted_tools:
+            tool_parts = [f"{name} {count}" for name, count in sorted_tools]
+            lines.append(f"  <span foreground='{bb}'>{' · '.join(tool_parts)}</span>")
+
+        # Tokens + thinking
+        thinking = (
+            f"  <span foreground='{theme.magenta}'>◆ {tokens.thinking_blocks}</span>"
+            if tokens.thinking_blocks else ""
+        )
+        lines.append(
+            f"  <span foreground='{theme.cyan}'>↓ {format_tokens(tokens.input_tokens)} in</span>"
+            f"   <span foreground='{theme.green}'>↑ {format_tokens(tokens.output_tokens)} out</span>"
+            f"{thinking}"
+        )
+
+        # Cache
+        efficiency = ""
+        if tokens.cache_write_tokens > 0:
+            ratio = tokens.cache_read_tokens / tokens.cache_write_tokens
+            efficiency = f" ({ratio:.1f}:1)"
+        lines.append(
+            f"  <span foreground='{bb}'>Cache: {format_tokens(tokens.cache_read_tokens)} read"
+            f" · {format_tokens(tokens.cache_write_tokens)} written{efficiency}</span>"
+        )
+
+        # Web
+        web_parts = []
+        if tokens.web_search_count:
+            web_parts.append(f"{tokens.web_search_count} searches")
+        if tokens.web_fetch_count:
+            web_parts.append(f"{tokens.web_fetch_count} fetches")
+        if web_parts:
+            lines.append(f"  <span foreground='{bb}'>Web: {' · '.join(web_parts)}</span>")
+
+        # Cost
+        cost = estimate_cost(tokens)
+        if cost > 0:
+            lines.append(f"  <span foreground='{theme.yellow}'>Est. cost: ~${cost:.2f}</span>")
 
     # Footer
     ts = data.get("timestamp", 0) / 1000
@@ -311,20 +390,308 @@ def format_reset_display(reset_str: str) -> str:
     return dt.strftime("%b %d, %H:%M")
 
 
+@dataclass(frozen=True)
+class BudgetInfo:
+    current_day: int
+    total_days: int
+    cumulative_budget: float
+    actual_percent: int
+    budget_ratio: float
+    filled_blocks: int
+
+
+def compute_budget_info(section: Optional[dict]) -> Optional[BudgetInfo]:
+    """Compute weekly budget progress from a usage section with resetTime."""
+    if not section:
+        return None
+    reset_str = section.get("resetTime", "")
+    if not reset_str:
+        return None
+
+    reset_dt = _parse_reset_dt(reset_str)
+    if reset_dt is None:
+        return None
+
+    tz_match = re.search(r'\(([\w/]+)\)', reset_str)
+    tz_name = tz_match.group(1) if tz_match else "UTC"
+
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tz_name)
+        now = datetime.now(tz)
+    except Exception:
+        now = datetime.now()
+
+    cycle_start = reset_dt - timedelta(days=7)
+    elapsed = (now - cycle_start).total_seconds() / 86400
+    current_day = max(1, min(7, int(elapsed) + 1))
+
+    daily_budget = 100.0 / 7
+    cumulative_budget = daily_budget * current_day
+    actual_percent = section.get("percent", 0)
+
+    if cumulative_budget > 0:
+        budget_ratio = (actual_percent / cumulative_budget) * 100
+    else:
+        budget_ratio = 0.0
+
+    filled_blocks = max(0, min(7, round(budget_ratio / 100 * 7)))
+
+    return BudgetInfo(
+        current_day=current_day,
+        total_days=7,
+        cumulative_budget=cumulative_budget,
+        actual_percent=actual_percent,
+        budget_ratio=budget_ratio,
+        filled_blocks=filled_blocks,
+    )
+
+
+@dataclass
+class TokenStats:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    session_count: int = 0
+    message_count: int = 0
+    user_msg_count: int = 0
+    tool_call_count: int = 0
+    thinking_blocks: int = 0
+    web_search_count: int = 0
+    web_fetch_count: int = 0
+    turn_duration_ms: int = 0
+    turn_count: int = 0
+    models: dict = field(default_factory=dict)
+    tools: dict = field(default_factory=dict)
+
+
+# Per-million-token pricing: (input, output, cache_read, cache_write)
+_MODEL_PRICING = {
+    "claude-opus-4-6":            (15.0,  75.0, 1.875,  18.75),
+    "claude-sonnet-4-6":          ( 3.0,  15.0, 0.30,    3.75),
+    "claude-haiku-4-5-20251001":  ( 0.80,  4.0, 0.08,    1.00),
+}
+
+
+def _short_model(model: str) -> str:
+    if "opus" in model:
+        return "Opus"
+    if "sonnet" in model:
+        return "Sonnet"
+    if "haiku" in model:
+        return "Haiku"
+    return model
+
+
+def _is_today(ts_str: str, today) -> bool:
+    try:
+        utc_dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return utc_dt.astimezone().date() == today
+    except Exception:
+        return False
+
+
+def compute_today_tokens() -> Optional[TokenStats]:
+    """Aggregate token usage from today's Claude Code sessions."""
+    try:
+        cache = json.loads(TOKEN_CACHE.read_text())
+        if time.time() - cache.get("timestamp", 0) < TOKEN_TTL:
+            fields = set(TokenStats.__dataclass_fields__)
+            return TokenStats(**{k: v for k, v in cache.items() if k in fields})
+    except Exception:
+        pass
+
+    if not PROJECTS_DIR.is_dir():
+        return None
+
+    today = datetime.now().date()
+    today_start = datetime.combine(today, datetime.min.time()).timestamp()
+
+    stats = TokenStats()
+    sessions: set[str] = set()
+
+    for f in PROJECTS_DIR.glob("*/*.jsonl"):
+        try:
+            if f.stat().st_mtime < today_start:
+                continue
+        except OSError:
+            continue
+
+        for line in f.open(encoding="utf-8", errors="replace"):
+            # Skip progress/snapshot noise (~60% of lines)
+            if '"_progress"' in line:
+                continue
+            if '"progress"' in line and '"system"' not in line:
+                continue
+            if '"file-history-snapshot"' in line or '"queue-operation"' in line:
+                continue
+
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            ts_str = entry.get("timestamp", "")
+            if not ts_str or not _is_today(ts_str, today):
+                continue
+
+            sid = entry.get("sessionId", "")
+            if sid:
+                sessions.add(sid)
+
+            entry_type = entry.get("type")
+
+            if entry_type == "assistant":
+                msg = entry.get("message", {})
+                usage = msg.get("usage")
+                if not usage:
+                    continue
+
+                stats.input_tokens += usage.get("input_tokens", 0)
+                stats.output_tokens += usage.get("output_tokens", 0)
+                stats.cache_read_tokens += usage.get("cache_read_input_tokens", 0)
+                stats.cache_write_tokens += usage.get("cache_creation_input_tokens", 0)
+                stats.message_count += 1
+
+                # Model tracking
+                model = msg.get("model", "unknown")
+                if model not in stats.models:
+                    stats.models[model] = {
+                        "count": 0, "input": 0, "output": 0,
+                        "cache_read": 0, "cache_write": 0,
+                    }
+                md = stats.models[model]
+                md["count"] += 1
+                md["input"] += usage.get("input_tokens", 0)
+                md["output"] += usage.get("output_tokens", 0)
+                md["cache_read"] += usage.get("cache_read_input_tokens", 0)
+                md["cache_write"] += usage.get("cache_creation_input_tokens", 0)
+
+                # Web search tracking
+                stu = usage.get("server_tool_use")
+                if stu:
+                    stats.web_search_count += stu.get("web_search_requests", 0)
+                    stats.web_fetch_count += stu.get("web_fetch_requests", 0)
+
+                # Content blocks: thinking + tool_use
+                for block in msg.get("content", []):
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "thinking":
+                        stats.thinking_blocks += 1
+                    elif btype == "tool_use":
+                        stats.tool_call_count += 1
+                        name = block.get("name", "unknown")
+                        stats.tools[name] = stats.tools.get(name, 0) + 1
+
+            elif entry_type == "user":
+                stats.user_msg_count += 1
+
+            elif entry_type == "system" and entry.get("subtype") == "turn_duration":
+                stats.turn_duration_ms += entry.get("durationMs", 0)
+                stats.turn_count += 1
+
+    stats.session_count = len(sessions)
+
+    try:
+        cache_data = {
+            "input_tokens": stats.input_tokens,
+            "output_tokens": stats.output_tokens,
+            "cache_read_tokens": stats.cache_read_tokens,
+            "cache_write_tokens": stats.cache_write_tokens,
+            "session_count": stats.session_count,
+            "message_count": stats.message_count,
+            "user_msg_count": stats.user_msg_count,
+            "tool_call_count": stats.tool_call_count,
+            "thinking_blocks": stats.thinking_blocks,
+            "web_search_count": stats.web_search_count,
+            "web_fetch_count": stats.web_fetch_count,
+            "turn_duration_ms": stats.turn_duration_ms,
+            "turn_count": stats.turn_count,
+            "models": stats.models,
+            "tools": stats.tools,
+            "timestamp": time.time(),
+        }
+        TOKEN_CACHE.write_text(json.dumps(cache_data))
+    except Exception:
+        pass
+
+    return stats if stats.message_count > 0 else None
+
+
+def estimate_cost(stats: TokenStats) -> float:
+    """Estimate USD cost from per-model token counts."""
+    total = 0.0
+    for model, data in stats.models.items():
+        pricing = _MODEL_PRICING.get(model)
+        if not pricing:
+            continue
+        inp_p, out_p, cr_p, cw_p = pricing
+        total += data["input"]       / 1_000_000 * inp_p
+        total += data["output"]      / 1_000_000 * out_p
+        total += data["cache_read"]  / 1_000_000 * cr_p
+        total += data["cache_write"] / 1_000_000 * cw_p
+    return total
+
+
+def format_tokens(n: int) -> str:
+    """Format token count: 823, 1.2K, 45.8K, 1.2M"""
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}K"
+    return f"{n / 1_000_000:.1f}M"
+
+
+def budget_color(ratio: float, theme: ColorTheme) -> str:
+    """Color for budget bar based on consumption ratio."""
+    if ratio > 100:
+        return theme.red
+    if ratio > 85:
+        return theme.bright_red
+    if ratio > 60:
+        return theme.yellow
+    return theme.green
+
+
+def budget_bar_text(info: Optional[BudgetInfo], theme: ColorTheme) -> str:
+    """Render 7-block budget bar: ▰▰▰▱▱▱▱"""
+    if info is None:
+        return f"<span foreground='{theme.bright_black}'>{'▱' * 7}</span>"
+
+    color = budget_color(info.budget_ratio, theme)
+    filled = '▰' * info.filled_blocks
+    empty = '▱' * (7 - info.filled_blocks)
+    return (
+        f"<span foreground='{color}'>{filled}</span>"
+        f"<span foreground='{theme.bright_black}'>{empty}</span>"
+    )
+
+
 def build_text(data: Optional[dict], theme: ColorTheme, fetching: bool) -> str:
+    bb = theme.bright_black
+    bar = budget_bar_text(None, theme)
+
     if data is None:
         spinner = "…" if fetching else "?"
-        return f"{CLAUDE_ICON} <span foreground='{theme.bright_black}'>{spinner}</span>"
+        return f"<span foreground='{bb}'>{spinner}</span> {bar}"
 
     session = data.get("session")
     if not session:
-        return f"{CLAUDE_ICON} <span foreground='{theme.bright_black}'>N/A</span>"
+        return f"<span foreground='{bb}'>N/A</span> {bar}"
 
     pct     = session.get("percent", 0)
     color   = usage_color(pct, theme)
     compact = format_reset_compact(session.get("resetTime", ""))
-    reset   = f" <span foreground='{theme.bright_black}'>↺{compact}</span>" if compact else ""
-    return f"{CLAUDE_ICON} <span foreground='{color}'>{pct}%</span>{reset}"
+    reset   = f" <span foreground='{bb}'>↺{compact}</span>" if compact else ""
+
+    week = data.get("week")
+    info = compute_budget_info(week)
+    bar  = budget_bar_text(info, theme)
+
+    return f"<span foreground='{color}'>{pct}%</span>{reset} {bar}"
 
 
 # =============================================================================

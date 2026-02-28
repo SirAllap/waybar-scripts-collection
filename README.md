@@ -402,24 +402,35 @@ Comprehensive system health monitoring.
 
 ### 🤖 Claude Code Usage (`waybar-claude-usage.py` + `waybar-claude-fetch.py`)
 
-Real-time Claude Code usage limits displayed in Waybar. Shows session (5h rolling window) and weekly usage as percentages with color-coded warnings.
+Real-time Claude Code usage limits and token tracking displayed in Waybar. Shows session usage, weekly budget progress, and detailed daily token analytics.
+
+**Bar:** `12% ↺59m ▰▰▰▱▱▱▱` — session %, reset countdown, 7-block weekly budget bar. Claude logo rendered as a PNG icon via CSS.
 
 **Features:**
-- Bar shows session usage % and time remaining until reset (e.g. `󰧿 16% ↺59m`)
+- Weekly budget bar: 7 blocks showing usage pace vs ideal daily budget (100%/7 per day), color-coded green/yellow/orange/red
 - Tooltip with progress bars for session, weekly (all models), weekly (Sonnet), and extra spend
-- Reset times displayed in 24h with date (e.g. `Feb 21, 02:00`)
-- Auto-hides when Claude Code hasn't been used in the last hour — zero resource use on non-coding days
+- Budget tracking per weekly section: `Day 2/7 — Budget: 28.6% — Used: 12%`
+- Daily token analytics parsed from `~/.claude/projects/` session JSONL files:
+  - Input/output token totals with human-readable formatting (1.2K, 45.8M)
+  - Per-model breakdown (Opus/Sonnet/Haiku message counts)
+  - Tool usage breakdown (top 6 by count)
+  - Cache efficiency ratio (read:write)
+  - Thinking block count
+  - Average turn duration
+  - Web search/fetch counts (when non-zero)
+  - Estimated daily cost based on per-model token pricing
+- Auto-hides when Claude Code hasn't been used in the last hour
 - Background fetcher (~8s) so Waybar never blocks
 - Click to force-refresh
-- Lock file prevents concurrent fetches
 
 **How it works:**
 
-`/usage` is a TUI-only command in Claude Code. `waybar-claude-fetch.py` spawns a PTY session, waits for the prompt, sends `/usage`, captures and parses the output, then writes a cache file. `waybar-claude-usage.py` reads that cache instantly and is what Waybar actually calls.
+`/usage` is a TUI-only command in Claude Code. `waybar-claude-fetch.py` spawns a PTY session, waits for the prompt, sends `/usage`, captures and parses the output, then writes a cache file. `waybar-claude-usage.py` reads that cache instantly and is what Waybar actually calls. Token stats are computed separately by parsing session JSONL files and cached for 120s.
 
 **Requirements:**
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
 - Default install path: `~/.local/bin/claude` (edit `CLAUDE_PATH` in `waybar-claude-fetch.py` if different)
+- Claude logo PNG at `~/.config/waybar/icons/claude.png` (convert from SVG: `rsvg-convert -w 28 -h 28 claude-color.svg -o ~/.config/waybar/icons/claude.png`)
 
 **Waybar config:**
 ```jsonc
@@ -437,10 +448,11 @@ Real-time Claude Code usage limits displayed in Waybar. Shows session (5h rollin
 **CSS (add to `style.css`):**
 ```css
 #custom-claude-usage {
-  background-color: @background;
-  border-radius: 10px;
-  padding: 0 10px;
-  margin: 0 0 0 5px;
+  background-image: url("~/.config/waybar/icons/claude.png");
+  background-repeat: no-repeat;
+  background-position: 8px center;
+  background-size: 14px 14px;
+  padding: 0 10px 0 26px;
 }
 
 #custom-claude-usage.inactive {
@@ -455,8 +467,9 @@ Real-time Claude Code usage limits displayed in Waybar. Shows session (5h rollin
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `CACHE_TTL` | `90` | Seconds between background fetches |
+| `CACHE_TTL` | `90` | Seconds between background usage fetches |
 | `ACTIVITY_TTL` | `3600` | Seconds of inactivity before module hides |
+| `TOKEN_TTL` | `120` | Seconds between token stats recomputation |
 
 ---
 
