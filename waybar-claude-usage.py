@@ -423,8 +423,7 @@ def compute_budget_info(section: Optional[dict]) -> Optional[BudgetInfo]:
         now = datetime.now()
 
     cycle_start = reset_dt - timedelta(days=7)
-    elapsed = (now - cycle_start).total_seconds() / 86400
-    current_day = max(1, min(7, int(elapsed) + 1))
+    current_day = max(1, min(7, (now.date() - cycle_start.date()).days + 1))
 
     daily_budget = 100.0 / 7
     cumulative_budget = daily_budget * current_day
