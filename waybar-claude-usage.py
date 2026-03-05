@@ -11,6 +11,7 @@ Lock:  /tmp/waybar_claude_fetch.lock
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -37,7 +38,7 @@ LOCK_FILE      = Path("/tmp/waybar_claude_fetch.lock")
 FETCH_SCRIPT   = Path.home() / ".config/waybar/scripts/waybar-claude-fetch.py"
 THEME_PATH     = Path.home() / ".config/omarchy/current/theme/colors.toml"
 CACHE_TTL      = 90    # seconds before triggering a background refresh
-BAR_WIDTH      = 20    # characters in progress bar
+BAR_WIDTH      = 14    # characters in progress bar
 ACTIVITY_TTL   = 3600  # seconds — hide module if no claude activity within this window
 HISTORY_FILE   = Path.home() / ".claude" / "history.jsonl"
 PROJECTS_DIR   = Path.home() / ".claude" / "projects"
@@ -116,7 +117,8 @@ def is_stale(data: Optional[dict]) -> bool:
     if data is None:
         return True
     ts = data.get("timestamp", 0) / 1000  # ms → s
-    return (time.time() - ts) > CACHE_TTL
+    ttl = 300 if data.get("error") == "rate_limited" else CACHE_TTL
+    return (time.time() - ts) > ttl
 
 
 def is_fetch_running() -> bool:
@@ -177,28 +179,38 @@ def progress_bar(pct: int, theme: ColorTheme) -> str:
     return f"[{bar}] <span foreground='{color}'>{pct}%</span>"
 
 
+def _pad(text: str, width: int) -> str:
+    """Pad plain text to width (for use inside a single Pango span)."""
+    return text + ' ' * max(0, width - len(text))
+
+
 def build_tooltip(data: Optional[dict], theme: ColorTheme, fetching: bool) -> str:
     lines: list[str] = []
     w = theme.white
     bb = theme.bright_black
+    sep = f"<span foreground='{bb}'>{'─' * 50}</span>"
 
-    header = f"<span foreground='{w}'>Claude Code Usage</span>"
-    lines.append(header)
-    lines.append(f"<span foreground='{bb}'>{'─' * 36}</span>")
+    lines.append(f"<span foreground='{w}'>Claude Code Usage</span>")
+    lines.append(sep)
+    lines.append("")
 
     if data is None:
         lines.append(f"<span foreground='{bb}'>Waiting for first fetch…</span>")
         lines.append(f"<span foreground='{bb}'>This takes ~20 seconds on first run.</span>")
         return "<span size='12000'>" + "\n".join(lines) + "</span>"
 
+    if data.get("error") == "rate_limited":
+        lines.append(f"<span foreground='{theme.bright_red}'>API rate limited — retrying in ~5m</span>")
+        lines.append("")
+
     sections = [
-        ("session",    "Session  (5h rolling)"),
-        ("week",       "Weekly   (all models)"),
-        ("weekSonnet", "Weekly   (Sonnet)"),
+        ("session",    "Session (5h)"),
+        ("week",       "Weekly (all)"),
+        ("weekSonnet", "Weekly (Son)"),
         ("extra",      "Extra spend"),
     ]
 
-    any_shown = False
+    shown_count = 0
     for key, label in sections:
         section = data.get(key)
         if not section:
@@ -206,108 +218,150 @@ def build_tooltip(data: Optional[dict], theme: ColorTheme, fetching: bool) -> st
         pct   = section.get("percent", 0)
         reset = section.get("resetTime", "")
         color = usage_color(pct, theme)
-        lines.append("")
-        lines.append(f"<span foreground='{w}'>{label}</span>")
-        lines.append(f"  {progress_bar(pct, theme)}")
+
+        # Blank line between usage sections
+        if shown_count > 0:
+            lines.append("")
+
+        # Label + bar + reset on one line
+        reset_str = ""
         if reset:
-            lines.append(f"  <span foreground='{bb}'>Resets: {format_reset_display(reset)}</span>")
+            compact = format_reset_compact(reset)
+            if compact:
+                reset_str = f" <span foreground='{bb}'>↺{compact}</span>"
+        lines.append(
+            f"<span foreground='{w}'>{_pad(label, 13)}</span>"
+            f" {progress_bar(pct, theme)}{reset_str}"
+        )
+
+        # Budget info for weekly — compact single line
         if key in ("week", "weekSonnet"):
             info = compute_budget_info(section)
             if info:
+                bcolor = budget_color(info.budget_ratio, theme)
                 lines.append(
-                    f"  <span foreground='{w}'>Day {info.current_day}/{info.total_days}"
-                    f" — Budget: {info.cumulative_budget:.1f}%"
-                    f" — Used: {info.actual_percent}%</span>"
+                    f"  {budget_bar_text(info, theme)}"
+                    f" <span foreground='{bb}'>Day {info.current_day}/{info.total_days}"
+                    f" · budget {info.cumulative_budget:.0f}%"
+                    f" · used</span>"
+                    f" <span foreground='{bcolor}'>{info.actual_percent}%</span>"
                 )
-                lines.append(f"  {budget_bar_text(info, theme)}")
+
         if key == "extra" and "spent" in section:
             spent = section["spent"]
             limit = section.get("limit", 0)
             lines.append(f"  <span foreground='{color}'>${spent:.2f} / ${limit:.2f} spent</span>")
-        any_shown = True
 
-    if not any_shown:
-        lines.append(f"<span foreground='{bb}'>No usage data found in last fetch.</span>")
+        shown_count += 1
 
     # Today's token usage
     tokens = compute_today_tokens()
     if tokens:
         lines.append("")
-        lines.append(f"<span foreground='{bb}'>{'─' * 36}</span>")
+        lines.append(sep)
+        lines.append("")
         total_msgs = tokens.message_count + tokens.user_msg_count
         lines.append(
             f"<span foreground='{w}'>Today</span>"
-            f"  <span foreground='{bb}'>{tokens.session_count} sessions"
+            f" <span foreground='{bb}'>{tokens.session_count} sess"
             f" · {total_msgs} msgs · {tokens.tool_call_count} tools</span>"
         )
 
-        # Models + avg turn
-        model_parts = []
-        for model in sorted(tokens.models, key=lambda m: tokens.models[m]["count"], reverse=True):
-            model_parts.append(f"{_short_model(model)} {tokens.models[model]['count']}")
-        avg_turn = ""
+        # Per-model breakdown — aligned columns
+        costs = estimate_cost(tokens)
+        sorted_models = sorted(tokens.models, key=lambda m: tokens.models[m]["count"], reverse=True)
+        for model in sorted_models:
+            md = tokens.models[model]
+            if md["count"] == 0:
+                continue
+            name = _short_model(model)
+            total_in = md["input"] + md["cache_read"] + md["cache_write"]
+            cnt_s = str(md["count"])
+            cost_part = ""
+            if model in costs:
+                cost_part = f" <span foreground='{theme.yellow}'>~${costs[model]:.0f}</span>"
+            lines.append(
+                f"  <span foreground='{bb}'>{_pad(name, 8)}{_pad(cnt_s, 5)}"
+                f"↓{_pad(format_tokens(total_in), 7)}"
+                f"↑{format_tokens(md['output'])}</span>"
+                f"{cost_part}"
+            )
+
+        lines.append("")
+
+        # Avg turn + thinking on one line
+        parts: list[str] = []
         if tokens.turn_count > 0:
             avg_s = tokens.turn_duration_ms / tokens.turn_count / 1000
             if avg_s >= 60:
                 mins, secs = divmod(int(avg_s), 60)
-                avg_turn = f" · avg turn {mins}m{secs}s"
+                parts.append(f"<span foreground='{bb}'>avg turn {mins}m{secs}s</span>")
             else:
-                avg_turn = f" · avg turn {int(avg_s)}s"
-        if model_parts:
-            lines.append(f"  <span foreground='{bb}'>{' · '.join(model_parts)}{avg_turn}</span>")
+                parts.append(f"<span foreground='{bb}'>avg turn {int(avg_s)}s</span>")
+        if tokens.thinking_blocks:
+            think_pct = round(tokens.thinking_blocks / tokens.message_count * 100) if tokens.message_count else 0
+            think_tok = format_tokens(tokens.thinking_chars // 4) if tokens.thinking_chars else ""
+            t = f"◆ {tokens.thinking_blocks} ({think_pct}%)"
+            if think_tok:
+                t += f" ~{think_tok}"
+            parts.append(f"<span foreground='{theme.magenta}'>{t}</span>")
+        if parts:
+            lines.append(f"  {' · '.join(parts)}")
 
-        # Top tools
-        sorted_tools = sorted(tokens.tools.items(), key=lambda x: x[1], reverse=True)[:6]
+        # Tokens
+        lines.append(
+            f"  <span foreground='{theme.cyan}'>↓{format_tokens(tokens.input_tokens)} in</span>"
+            f"  <span foreground='{theme.green}'>↑{format_tokens(tokens.output_tokens)} out</span>"
+        )
+
+        # Cache + web on one line
+        cache_parts = []
+        if tokens.cache_read_tokens or tokens.cache_write_tokens:
+            efficiency = ""
+            if tokens.cache_write_tokens > 0:
+                ratio = tokens.cache_read_tokens / tokens.cache_write_tokens
+                efficiency = f" ({ratio:.1f}:1)"
+            cache_parts.append(
+                f"cache {format_tokens(tokens.cache_read_tokens)}r"
+                f"/{format_tokens(tokens.cache_write_tokens)}w{efficiency}"
+            )
+        ws = tokens.tools.get("WebSearch", 0)
+        wf = tokens.tools.get("WebFetch", 0)
+        if ws or wf:
+            web = "web"
+            if ws:
+                web += f" {ws}s"
+            if wf:
+                web += f" {wf}f"
+            cache_parts.append(web)
+        if cache_parts:
+            lines.append(f"  <span foreground='{bb}'>{' · '.join(cache_parts)}</span>")
+
+        lines.append("")
+
+        # Top tools — rows of 4
+        sorted_tools = sorted(tokens.tools.items(), key=lambda x: x[1], reverse=True)[:8]
         if sorted_tools:
-            tool_parts = [f"{name} {count}" for name, count in sorted_tools]
-            lines.append(f"  <span foreground='{bb}'>{' · '.join(tool_parts)}</span>")
-
-        # Tokens + thinking
-        thinking = (
-            f"  <span foreground='{theme.magenta}'>◆ {tokens.thinking_blocks}</span>"
-            if tokens.thinking_blocks else ""
-        )
-        lines.append(
-            f"  <span foreground='{theme.cyan}'>↓ {format_tokens(tokens.input_tokens)} in</span>"
-            f"   <span foreground='{theme.green}'>↑ {format_tokens(tokens.output_tokens)} out</span>"
-            f"{thinking}"
-        )
-
-        # Cache
-        efficiency = ""
-        if tokens.cache_write_tokens > 0:
-            ratio = tokens.cache_read_tokens / tokens.cache_write_tokens
-            efficiency = f" ({ratio:.1f}:1)"
-        lines.append(
-            f"  <span foreground='{bb}'>Cache: {format_tokens(tokens.cache_read_tokens)} read"
-            f" · {format_tokens(tokens.cache_write_tokens)} written{efficiency}</span>"
-        )
-
-        # Web
-        web_parts = []
-        if tokens.web_search_count:
-            web_parts.append(f"{tokens.web_search_count} searches")
-        if tokens.web_fetch_count:
-            web_parts.append(f"{tokens.web_fetch_count} fetches")
-        if web_parts:
-            lines.append(f"  <span foreground='{bb}'>Web: {' · '.join(web_parts)}</span>")
+            for i in range(0, len(sorted_tools), 4):
+                chunk = sorted_tools[i:i+4]
+                tool_parts = [f"{name} {count}" for name, count in chunk]
+                lines.append(f"  <span foreground='{bb}'>{' · '.join(tool_parts)}</span>")
 
         # Cost
-        cost = estimate_cost(tokens)
-        if cost > 0:
-            lines.append(f"  <span foreground='{theme.yellow}'>Est. cost: ~${cost:.2f}</span>")
+        total_cost = costs["_total"]
+        if total_cost > 0:
+            lines.append(f"  <span foreground='{theme.yellow}'>~${total_cost:.2f}</span>")
 
     # Footer
     ts = data.get("timestamp", 0) / 1000
     age = int(time.time() - ts)
     from_cache = data.get("fromCache", False)
-    cache_note = "  (cached)" if from_cache else ""
-    status = "fetching…" if fetching else f"updated {age}s ago{cache_note}"
+    cache_note = " (cached)" if from_cache else ""
+    status = "fetching…" if fetching else f"{age}s ago{cache_note}"
 
     lines.append("")
-    lines.append(f"<span foreground='{bb}'>{'─' * 36}</span>")
-    lines.append(f"<span foreground='{bb}'>{status}</span>")
-    lines.append(f"<span foreground='{bb}'>LMB: force refresh</span>")
+    lines.append(sep)
+    lines.append(f"<span foreground='{bb}'>{status} · LMB: refresh</span>")
 
     return "<span size='12000'>" + "\n".join(lines) + "</span>"
 
@@ -457,8 +511,7 @@ class TokenStats:
     user_msg_count: int = 0
     tool_call_count: int = 0
     thinking_blocks: int = 0
-    web_search_count: int = 0
-    web_fetch_count: int = 0
+    thinking_chars: int = 0
     turn_duration_ms: int = 0
     turn_count: int = 0
     models: dict = field(default_factory=dict)
@@ -480,7 +533,11 @@ def _short_model(model: str) -> str:
         return "Sonnet"
     if "haiku" in model:
         return "Haiku"
-    return model
+    if "synthetic" in model:
+        return "synth"
+    # Truncate unknown models to keep alignment
+    clean = model.strip("<>")
+    return html.escape(clean[:7])
 
 
 def _is_today(ts_str: str, today) -> bool:
@@ -567,12 +624,6 @@ def compute_today_tokens() -> Optional[TokenStats]:
                 md["cache_read"] += usage.get("cache_read_input_tokens", 0)
                 md["cache_write"] += usage.get("cache_creation_input_tokens", 0)
 
-                # Web search tracking
-                stu = usage.get("server_tool_use")
-                if stu:
-                    stats.web_search_count += stu.get("web_search_requests", 0)
-                    stats.web_fetch_count += stu.get("web_fetch_requests", 0)
-
                 # Content blocks: thinking + tool_use
                 for block in msg.get("content", []):
                     if not isinstance(block, dict):
@@ -580,6 +631,7 @@ def compute_today_tokens() -> Optional[TokenStats]:
                     btype = block.get("type")
                     if btype == "thinking":
                         stats.thinking_blocks += 1
+                        stats.thinking_chars += len(block.get("thinking", ""))
                     elif btype == "tool_use":
                         stats.tool_call_count += 1
                         name = block.get("name", "unknown")
@@ -605,8 +657,7 @@ def compute_today_tokens() -> Optional[TokenStats]:
             "user_msg_count": stats.user_msg_count,
             "tool_call_count": stats.tool_call_count,
             "thinking_blocks": stats.thinking_blocks,
-            "web_search_count": stats.web_search_count,
-            "web_fetch_count": stats.web_fetch_count,
+            "thinking_chars": stats.thinking_chars,
             "turn_duration_ms": stats.turn_duration_ms,
             "turn_count": stats.turn_count,
             "models": stats.models,
@@ -620,19 +671,28 @@ def compute_today_tokens() -> Optional[TokenStats]:
     return stats if stats.message_count > 0 else None
 
 
-def estimate_cost(stats: TokenStats) -> float:
-    """Estimate USD cost from per-model token counts."""
+def estimate_cost(stats: TokenStats) -> dict[str, float]:
+    """Estimate USD cost from per-model token counts.
+
+    Returns dict with per-model costs keyed by model ID, plus "_total".
+    """
+    costs: dict[str, float] = {}
     total = 0.0
     for model, data in stats.models.items():
         pricing = _MODEL_PRICING.get(model)
         if not pricing:
             continue
         inp_p, out_p, cr_p, cw_p = pricing
-        total += data["input"]       / 1_000_000 * inp_p
-        total += data["output"]      / 1_000_000 * out_p
-        total += data["cache_read"]  / 1_000_000 * cr_p
-        total += data["cache_write"] / 1_000_000 * cw_p
-    return total
+        model_cost = (
+            data["input"]       / 1_000_000 * inp_p
+            + data["output"]    / 1_000_000 * out_p
+            + data["cache_read"]  / 1_000_000 * cr_p
+            + data["cache_write"] / 1_000_000 * cw_p
+        )
+        costs[model] = model_cost
+        total += model_cost
+    costs["_total"] = total
+    return costs
 
 
 def format_tokens(n: int) -> str:

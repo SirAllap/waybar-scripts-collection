@@ -194,7 +194,10 @@ def fetch_via_pty() -> dict:
     except OSError:
         pass
 
-    return parse_usage(_cleaned())
+    cleaned = _cleaned()
+    if re.search(r'rate.limit', cleaned, re.IGNORECASE):
+        return {"error": "rate_limited", "timestamp": int(time.time() * 1000)}
+    return parse_usage(cleaned)
 
 
 # =============================================================================
@@ -221,7 +224,13 @@ def main() -> None:
         sys.exit(0)
     try:
         data = fetch_via_pty()
-        if data.get("session") or data.get("week"):
+        if data.get("error") == "rate_limited":
+            old = load_cache()
+            payload = old if old else {}
+            payload["error"] = "rate_limited"
+            payload["timestamp"] = int(time.time() * 1000)
+            save_cache(payload)
+        elif data.get("session") or data.get("week"):
             save_cache(data)
         else:
             old = load_cache()
