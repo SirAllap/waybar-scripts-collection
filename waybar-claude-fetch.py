@@ -74,7 +74,34 @@ def clean_ansi(raw: str) -> str:
 # PARSING
 # =============================================================================
 
+def _clean_reset(rt: str) -> str:
+    rt = rt.strip()
+    rt = re.sub(r'^[a-z]{1,2}\s+', '', rt, flags=re.IGNORECASE)
+    return re.sub(r'\s+', ' ', rt)
+
+
+def _ctx_extract(text: str, keyword_pat: str, window: int = 400
+                 ) -> tuple[Optional[int], Optional[str]]:
+    """Find the LAST occurrence of keyword_pat and return (pct, resetTime) from
+    the window following it.  Returns (None, None) if not found."""
+    best_pct: Optional[int] = None
+    best_reset: Optional[str] = None
+    for m in re.finditer(keyword_pat, text, re.IGNORECASE):
+        chunk = text[m.start():m.start() + window]
+        pm = re.findall(r'(\d+)\s*%\s*used', chunk, re.IGNORECASE)
+        if pm:
+            best_pct = int(pm[0])
+            rm = re.findall(r'Rese\w*\s+([\w\d,: ]+\([\w\/]+\))', chunk, re.IGNORECASE)
+            best_reset = _clean_reset(rm[0]) if rm else None
+    return best_pct, best_reset
+
+
 def parse_usage(text: str) -> dict:
+    # The /usage TUI renders in two frames (quick initial + updated after local
+    # scan), causing percentages to appear multiple times.  Use context-aware
+    # extraction keyed on section headers, taking the LAST occurrence so the
+    # updated frame wins.  Extra spend has no "% used" in the TUI at all —
+    # compute it from spent/limit instead.
     result: dict = {
         "session":    None,
         "week":       None,
@@ -83,24 +110,40 @@ def parse_usage(text: str) -> dict:
         "timestamp":  int(time.time() * 1000),
         "fromCache":  False,
     }
-    pct_matches = re.findall(r'(\d+)\s*%\s*used', text, re.IGNORECASE)
-    reset_matches = re.findall(
-        r'Rese\w*\s+([\w\d,: ]+\([\w\/]+\))', text, re.IGNORECASE
-    )
+
+    pct, rt = _ctx_extract(text, r'Cu[\s\w]{0,12}ssion')
+    if pct is not None:
+        result["session"] = {"percent": pct}
+        if rt:
+            result["session"]["resetTime"] = rt
+
+    pct, rt = _ctx_extract(text, r'all\s+models')
+    if pct is not None:
+        result["week"] = {"percent": pct}
+        if rt:
+            result["week"]["resetTime"] = rt
+
+    pct, rt = _ctx_extract(text, r'[Ss]onnet\s+only')
+    if pct is not None:
+        result["weekSonnet"] = {"percent": pct}
+        if rt:
+            result["weekSonnet"]["resetTime"] = rt
+
     spend_match = re.search(
         r'\$(\d+\.?\d*)\s*/\s*\$(\d+\.?\d*)\s*spent', text, re.IGNORECASE
     )
-    sections = ["session", "week", "weekSonnet", "extra"]
-    for idx, key in enumerate(sections[:len(pct_matches)]):
-        result[key] = {"percent": int(pct_matches[idx])}
-        if idx < len(reset_matches):
-            rt = reset_matches[idx].strip()
-            rt = re.sub(r'^[a-z]{1,2}\s+', '', rt, flags=re.IGNORECASE)
-            rt = re.sub(r'\s+', ' ', rt)
-            result[key]["resetTime"] = rt
-    if result["extra"] and spend_match:
-        result["extra"]["spent"] = float(spend_match.group(1))
-        result["extra"]["limit"] = float(spend_match.group(2))
+    if spend_match:
+        spent = float(spend_match.group(1))
+        limit = float(spend_match.group(2))
+        pct_extra = round(spent / limit * 100) if limit > 0 else 0
+        result["extra"] = {"percent": pct_extra, "spent": spent, "limit": limit}
+        reset_extra = re.search(
+            r'spent\s*[·\-–]?\s*Rese\w*\s+([\w\d,: ]+\([\w\/]+\))',
+            text, re.IGNORECASE
+        )
+        if reset_extra:
+            result["extra"]["resetTime"] = _clean_reset(reset_extra.group(1))
+
     return result
 
 
@@ -195,9 +238,11 @@ def fetch_via_pty() -> dict:
         pass
 
     cleaned = _cleaned()
-    if re.search(r'rate.limit', cleaned, re.IGNORECASE):
-        return {"error": "rate_limited", "timestamp": int(time.time() * 1000)}
-    return parse_usage(cleaned)
+    result = parse_usage(cleaned)
+    if not result.get("session") and not result.get("week"):
+        if re.search(r'rate.limit', cleaned, re.IGNORECASE):
+            return {"error": "rate_limited", "timestamp": int(time.time() * 1000)}
+    return result
 
 
 # =============================================================================
