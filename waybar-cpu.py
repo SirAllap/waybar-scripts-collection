@@ -35,15 +35,17 @@ POWER_STATE_FILE = "/tmp/waybar_cpu_power_state.json"
 TOOLTIP_WIDTH = 50
 FAN_PROFILE_FILE = "/tmp/fan-profile"
 FAN_PROFILES = {
-    "desktop": {"label": "Desktop", "icon": "󰧨", "mintemp": 35, "maxtemp": 75, "minpwm": 70, "maxpwm": 255},
-    "gaming":  {"label": "Gaming",  "icon": "󰊗", "mintemp": 35, "maxtemp": 60, "minpwm": 120, "maxpwm": 255},
+    "night": {"label": "Night", "icon": "󰖔", "pwm": 75},
+    "quiet": {"label": "Quiet", "icon": "󰈐", "pwm": 130},
+    "turbo": {"label": "Turbo", "icon": "󰓅", "pwm": 255},
 }
+FAN_CYCLE = ["night", "quiet", "turbo"]
 
 # Remove unused imports: shutil, pickle, signal (security + cleanup)
 
 
 def read_fan_profile():
-    """Read current fan profile, default to desktop"""
+    """Read current fan profile, default to quiet"""
     try:
         with open(FAN_PROFILE_FILE, "r") as f:
             profile = f.read().strip()
@@ -51,23 +53,41 @@ def read_fan_profile():
                 return profile
     except Exception:
         pass
-    return "desktop"
+    return "quiet"
 
 
 def toggle_fan_profile():
-    """Toggle fan profile between desktop and gaming, write to file, notify"""
+    """Cycle fan profile: night → quiet → turbo → night"""
     current = read_fan_profile()
-    new_profile = "gaming" if current == "desktop" else "desktop"
+    if current not in FAN_CYCLE:
+        current = "quiet"
+    new_profile = FAN_CYCLE[(FAN_CYCLE.index(current) + 1) % len(FAN_CYCLE)]
     try:
         with open(FAN_PROFILE_FILE, "w") as f:
             f.write(new_profile)
     except Exception:
         send_notification("Fan Profile Error", "Failed to write profile file", "critical")
         return
+    if current == "night":
+        subprocess.run(
+            ["sudo", "/usr/local/bin/fan-night-daemon", "stop"],
+            capture_output=True, check=False
+        )
+    if new_profile == "night":
+        subprocess.Popen(
+            ["sudo", "/usr/local/bin/fan-night-daemon"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    else:
+        subprocess.run(
+            ["sudo", "/usr/local/bin/fan-control", new_profile],
+            capture_output=True, check=False
+        )
     info = FAN_PROFILES[new_profile]
+    pwm_desc = "auto curve (75–255)" if new_profile == "night" else f"PWM {info['pwm']}/255 ({info['pwm']/255*100:.0f}%)"
     send_notification(
-        f"{info['icon']} Fan Profile: {info['label']}",
-        f"Curve: {info['minpwm']/255*100:.0f}%→100% over {info['mintemp']}°C→{info['maxtemp']}°C",
+        f"{info['icon']} Fans: {info['label']}",
+        pwm_desc,
     )
 
 
